@@ -7,27 +7,34 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repo (for your icon)
+        uses: actions/checkout@v4
+
       - name: Download CelLua v2.0.2, LÖVE & appimagetool
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           curl -fL -A "Mozilla/5.0" "https://archive.org" -o CelLua.love
-          curl -fL "https://github.com" -o love-11.5-x86_64.AppImage
-          curl -fL "https://github.com" -o appimagetool-x86_64.AppImage
-          chmod +x love-11.5-x86_64.AppImage appimagetool-x86_64.AppImage
+          gh release download 11.5 --repo love2d/love --pattern "*x86_64.AppImage" --output love.AppImage
+          gh release download continuous --repo AppImage/appimagetool --pattern "*x86_64.AppImage" --output appimagetool.AppImage
+          chmod +x love.AppImage appimagetool.AppImage
 
-      - name: Extract Icon & Fuse CelLua
+      - name: Fuse CelLua & Apply Repo Icon
         run: |
-          ./love-11.5-x86_64.AppImage --appimage-extract
+          ./love.AppImage --appimage-extract
           cat squashfs-root/bin/love CelLua.love > squashfs-root/bin/CelLua
           chmod +x squashfs-root/bin/CelLua
           rm squashfs-root/bin/love
 
-          python3 -c '
-          import zipfile, io
+          # Grab the PNG icon from your repo and ensure it's 256x256
+          ICON_FILE=$(ls *.png | head -n 1)
+          python3 -c "
           from PIL import Image
-          with zipfile.ZipFile("CelLua.love") as z:
-              img = Image.open(io.BytesIO(z.read("textures/puller.png")))
-          img.resize((256, 256), Image.NEAREST).save("squashfs-root/cellua.png")
-          '
+          img = Image.open('$ICON_FILE')
+          if img.size != (256, 256):
+              img = img.resize((256, 256), Image.NEAREST)
+          img.save('squashfs-root/cellua.png')
+          "
           rm -f squashfs-root/love.svg squashfs-root/.DirIcon
           ln -s cellua.png squashfs-root/.DirIcon
 
@@ -40,7 +47,7 @@ jobs:
 
       - name: Package AppImage
         run: |
-          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run squashfs-root CelLua-v2.0.2-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool.AppImage --appimage-extract-and-run squashfs-root CelLua-v2.0.2-x86_64.AppImage
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
