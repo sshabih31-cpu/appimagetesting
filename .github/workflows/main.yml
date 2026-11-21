@@ -1,4 +1,4 @@
-name: Build CelLua AppImage
+name: Build Super Mario 63 AppImage
 
 on:
   workflow_dispatch:
@@ -7,51 +7,70 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo (for your icon)
+      - name: Checkout repo (for SWF and icon)
         uses: actions/checkout@v4
 
-      - name: Download CelLua v2.0.2, LÖVE & appimagetool
+      - name: Download Ruffle Linux & appimagetool
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          curl -fL -A "Mozilla/5.0" "https://archive.org" -o CelLua.love
-          gh release download 11.5 --repo love2d/love --pattern "*x86_64.AppImage" --output love.AppImage
-          gh release download continuous --repo AppImage/appimagetool --pattern "*x86_64.AppImage" --output appimagetool.AppImage
-          chmod +x love.AppImage appimagetool.AppImage
+          RELEASE_TAG=$(gh release list --repo ruffle-rs/ruffle --limit 1 --json tagName --jq '.[0].tagName')
+          gh release download "$RELEASE_TAG" --repo ruffle-rs/ruffle --pattern "*linux-x86_64.tar.gz" --output ruffle.tar.gz
 
-      - name: Fuse CelLua & Apply Repo Icon
+          gh release download continuous --repo AppImage/appimagetool --pattern "*x86_64.AppImage" --output appimagetool.AppImage
+          chmod +x appimagetool.AppImage
+
+      - name: Build AppDir (Ruffle + SWF + Icon)
         run: |
           sudo apt-get update && sudo apt-get install -y python3-pil
-          ./love.AppImage --appimage-extract
-          cat squashfs-root/bin/love CelLua.love > squashfs-root/bin/CelLua
-          chmod +x squashfs-root/bin/CelLua
-          rm -f squashfs-root/bin/love
+          mkdir -p AppDir/bin tmp_ruffle
 
+          # Extract Ruffle and move binary to AppDir/bin/ruffle even if nested in a folder
+          tar -xzf ruffle.tar.gz -C tmp_ruffle
+          RUFFLE_BIN=$(find tmp_ruffle -name "ruffle" -type f | head -n 1)
+          cp "$RUFFLE_BIN" AppDir/bin/ruffle
+          chmod +x AppDir/bin/ruffle
+          rm -rf tmp_ruffle
+
+          # Copy SWF into AppDir
+          SWF_FILE=$(ls *.swf | head -n 1)
+          cp "$SWF_FILE" AppDir/bin/game.swf
+
+          # Resize and install 256x256 icon
           ICON_FILE=$(ls *.png | head -n 1)
           python3 -c "
           from PIL import Image
-          img = Image.open('$ICON_FILE')
+          img = Image.open('$ICON_FILE').convert('RGBA')
           if img.size != (256, 256):
               img = img.resize((256, 256), Image.NEAREST)
-          img.save('squashfs-root/cellua.png')
+          img.save('AppDir/sm63.png')
           "
-          rm -f squashfs-root/love.svg squashfs-root/.DirIcon
-          ln -s cellua.png squashfs-root/.DirIcon
+          ln -s sm63.png AppDir/.DirIcon
 
-          mv squashfs-root/love.desktop squashfs-root/cellua.desktop
-          sed -i 's/Exec=love %f/Exec=CelLua %f/g' squashfs-root/cellua.desktop
-          sed -i 's/Name=LÖVE/Name=CelLua Machine/g' squashfs-root/cellua.desktop
-          sed -i 's/Icon=love/Icon=cellua/g' squashfs-root/cellua.desktop
+          # Create .desktop entry
+          cat << 'EOF' > AppDir/sm63.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=Super Mario 63
+          Exec=AppRun
+          Icon=sm63
+          Categories=Game;
+          EOF
 
-          printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "${0}")")"\nexec "$HERE/bin/CelLua" "$@"\n' > squashfs-root/AppRun
-          chmod +x squashfs-root/AppRun
+          # Create AppRun launcher booting straight into fullscreen
+          cat << 'EOF' > AppDir/AppRun
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          exec "$HERE/bin/ruffle" --fullscreen "$HERE/bin/game.swf" "$@"
+          EOF
+          chmod +x AppDir/AppRun
 
       - name: Package AppImage
         run: |
-          ARCH=x86_64 ./appimagetool.AppImage --appimage-extract-and-run squashfs-root CelLua-v2.0.2-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool.AppImage --appimage-extract-and-run AppDir Super-Mario-63-x86_64.AppImage
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
-          name: CelLua-v2.0.2-Linux-AppImage
-          path: CelLua-v2.0.2-x86_64.AppImage
+          name: Super-Mario-63-Linux-AppImage
+          path: Super-Mario-63-x86_64.AppImage
