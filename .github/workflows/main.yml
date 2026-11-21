@@ -21,12 +21,12 @@ jobs:
 
       - name: Fuse CelLua & Apply Repo Icon
         run: |
+          sudo apt-get update && sudo apt-get install -y python3-pil
           ./love.AppImage --appimage-extract
           cat squashfs-root/bin/love CelLua.love > squashfs-root/bin/CelLua
           chmod +x squashfs-root/bin/CelLua
-          rm squashfs-root/bin/love
+          rm -f squashfs-root/bin/love
 
-          # Grab the PNG icon from your repo and ensure it's 256x256
           ICON_FILE=$(ls *.png | head -n 1)
           python3 -c "
           from PIL import Image
@@ -38,9 +38,10 @@ jobs:
           rm -f squashfs-root/love.svg squashfs-root/.DirIcon
           ln -s cellua.png squashfs-root/.DirIcon
 
-          sed -i 's/Exec=love %f/Exec=CelLua %f/g' squashfs-root/love.desktop
-          sed -i 's/Name=LÖVE/Name=CelLua Machine/g' squashfs-root/love.desktop
-          sed -i 's/Icon=love/Icon=cellua/g' squashfs-root/love.desktop
+          mv squashfs-root/love.desktop squashfs-root/cellua.desktop
+          sed -i 's/Exec=love %f/Exec=CelLua %f/g' squashfs-root/cellua.desktop
+          sed -i 's/Name=LÖVE/Name=CelLua Machine/g' squashfs-root/cellua.desktop
+          sed -i 's/Icon=love/Icon=cellua/g' squashfs-root/cellua.desktop
 
           printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "${0}")")"\nexec "$HERE/bin/CelLua" "$@"\n' > squashfs-root/AppRun
           chmod +x squashfs-root/AppRun
