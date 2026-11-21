@@ -1,4 +1,4 @@
-name: Build Super Mario 63 AppImage
+name: Build FreeGames AppImage
 
 on:
   workflow_dispatch:
@@ -7,34 +7,28 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo (for SWF and icon)
+      - name: Checkout repo (for launcher.py and icon)
         uses: actions/checkout@v4
 
-      - name: Download Ruffle Linux & appimagetool
+      - name: Download appimagetool
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          RELEASE_TAG=$(gh release list --repo ruffle-rs/ruffle --limit 1 --json tagName --jq '.[0].tagName')
-          gh release download "$RELEASE_TAG" --repo ruffle-rs/ruffle --pattern "*linux-x86_64.tar.gz" --output ruffle.tar.gz
-
           gh release download continuous --repo AppImage/appimagetool --pattern "*x86_64.AppImage" --output appimagetool.AppImage
           chmod +x appimagetool.AppImage
 
-      - name: Build AppDir (Ruffle + SWF + Icon)
+      - name: Build AppDir (Python venv + freegames + Icon)
         run: |
-          sudo apt-get update && sudo apt-get install -y python3-pil
-          mkdir -p AppDir/bin tmp_ruffle
+          sudo apt-get update && sudo apt-get install -y python3-pil python3-venv python3-tk
+          mkdir -p AppDir/opt
 
-          # Extract Ruffle and move binary to AppDir/bin/ruffle even if nested in a folder
-          tar -xzf ruffle.tar.gz -C tmp_ruffle
-          RUFFLE_BIN=$(find tmp_ruffle -name "ruffle" -type f | head -n 1)
-          cp "$RUFFLE_BIN" AppDir/bin/ruffle
-          chmod +x AppDir/bin/ruffle
-          rm -rf tmp_ruffle
+          # Create isolated virtual environment inside AppDir and install freegames
+          python3 -m venv --copies AppDir/opt/venv
+          AppDir/opt/venv/bin/pip install --upgrade pip
+          AppDir/opt/venv/bin/pip install freegames
 
-          # Copy SWF into AppDir
-          SWF_FILE=$(ls *.swf | head -n 1)
-          cp "$SWF_FILE" AppDir/bin/game.swf
+          # Copy launcher script
+          cp launcher.py AppDir/opt/launcher.py
 
           # Resize and install 256x256 icon
           ICON_FILE=$(ls *.png | head -n 1)
@@ -43,34 +37,35 @@ jobs:
           img = Image.open('$ICON_FILE').convert('RGBA')
           if img.size != (256, 256):
               img = img.resize((256, 256), Image.NEAREST)
-          img.save('AppDir/sm63.png')
+          img.save('AppDir/freegames.png')
           "
-          ln -s sm63.png AppDir/.DirIcon
+          ln -s freegames.png AppDir/.DirIcon
 
           # Create .desktop entry
-          cat << 'EOF' > AppDir/sm63.desktop
+          cat << 'EOF' > AppDir/freegames.desktop
           [Desktop Entry]
           Type=Application
-          Name=Super Mario 63
+          Name=FreeGames Launcher
           Exec=AppRun
-          Icon=sm63
+          Icon=freegames
+          Terminal=true
           Categories=Game;
           EOF
 
-          # Create AppRun launcher booting straight into fullscreen
+          # Create AppRun using bundled venv Python
           cat << 'EOF' > AppDir/AppRun
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "${0}")")"
-          exec "$HERE/bin/ruffle" --fullscreen "$HERE/bin/game.swf" "$@"
+          exec "$HERE/opt/venv/bin/python" "$HERE/opt/launcher.py" "$@"
           EOF
           chmod +x AppDir/AppRun
 
       - name: Package AppImage
         run: |
-          ARCH=x86_64 ./appimagetool.AppImage --appimage-extract-and-run AppDir Super-Mario-63-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool.AppImage --appimage-extract-and-run AppDir FreeGames-Launcher-x86_64.AppImage
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
-          name: Super-Mario-63-Linux-AppImage
-          path: Super-Mario-63-x86_64.AppImage
+          name: FreeGames-Launcher-Linux-AppImage
+          path: FreeGames-Launcher-x86_64.AppImage
