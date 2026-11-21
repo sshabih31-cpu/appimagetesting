@@ -9,9 +9,9 @@ jobs:
     steps:
       - name: Download CelLua v2.0.2, LÖVE & appimagetool
         run: |
-          wget -L -O CelLua.love "https://archive.org/download/cel-lua-machine-v-2.0.2/CelLua%20Machine%20v2.0.2.love"
-          wget -q https://github.com
-          wget -q https://github.com
+          curl -fL -A "Mozilla/5.0" "https://archive.org" -o CelLua.love
+          curl -fL "https://github.com" -o love-11.5-x86_64.AppImage
+          curl -fL "https://github.com" -o appimagetool-x86_64.AppImage
           chmod +x love-11.5-x86_64.AppImage appimagetool-x86_64.AppImage
 
       - name: Extract Icon & Fuse CelLua
@@ -21,13 +21,16 @@ jobs:
           chmod +x squashfs-root/bin/CelLua
           rm squashfs-root/bin/love
 
-          # Extract Puller texture from CelLua.love and scale cleanly to 256x256
-          unzip -p CelLua.love textures/puller.png > raw_icon.png
-          convert raw_icon.png -filter point -resize 256x256 squashfs-root/cellua.png
+          python3 -c '
+          import zipfile, io
+          from PIL import Image
+          with zipfile.ZipFile("CelLua.love") as z:
+              img = Image.open(io.BytesIO(z.read("textures/puller.png")))
+          img.resize((256, 256), Image.NEAREST).save("squashfs-root/cellua.png")
+          '
           rm -f squashfs-root/love.svg squashfs-root/.DirIcon
           ln -s cellua.png squashfs-root/.DirIcon
 
-          # Update desktop metadata & AppRun
           sed -i 's/Exec=love %f/Exec=CelLua %f/g' squashfs-root/love.desktop
           sed -i 's/Name=LÖVE/Name=CelLua Machine/g' squashfs-root/love.desktop
           sed -i 's/Icon=love/Icon=cellua/g' squashfs-root/love.desktop
