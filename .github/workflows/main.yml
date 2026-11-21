@@ -7,7 +7,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo (for launcher.py and icon)
+      - name: Checkout repo (for icon)
         uses: actions/checkout@v4
 
       - name: Download appimagetool
@@ -17,7 +17,7 @@ jobs:
           gh release download continuous --repo AppImage/appimagetool --pattern "*x86_64.AppImage" --output appimagetool.AppImage
           chmod +x appimagetool.AppImage
 
-      - name: Build AppDir (Python venv + freegames + Icon)
+      - name: Build AppDir (GUI Launcher + Python venv + freegames + Icon)
         run: |
           sudo apt-get update && sudo apt-get install -y python3-pil python3-venv python3-tk
           mkdir -p AppDir/opt
@@ -27,8 +27,109 @@ jobs:
           AppDir/opt/venv/bin/pip install --upgrade pip
           AppDir/opt/venv/bin/pip install freegames
 
-          # Copy launcher script
-          cp launcher.py AppDir/opt/launcher.py
+          # Write GUI launcher script so it works from desktop/file-manager or terminal
+          cat << 'EOF' > AppDir/opt/launcher.py
+          import importlib
+          import pkgutil
+          import sys
+          import tkinter as tk
+          from tkinter import messagebox, ttk
+          import turtle
+
+
+          def get_freegames_list():
+              import freegames
+
+              games = []
+              package_path = getattr(freegames, "__path__", None)
+              if package_path:
+                  for _, name, is_pkg in pkgutil.iter_modules(package_path):
+                      if not is_pkg and not name.startswith("_"):
+                          games.append(name)
+              return sorted(games)
+
+
+          def launch_game(game_name, root):
+              module_name = f"freegames.{game_name}"
+              root.withdraw()
+              try:
+                  turtle.TurtleScreen._RUNNING = True
+                  try:
+                      turtle.clearscreen()
+                  except turtle.Terminator:
+                      pass
+
+                  if module_name in sys.modules:
+                      mod = importlib.reload(sys.modules[module_name])
+                  else:
+                      mod = importlib.import_module(module_name)
+
+                  if hasattr(mod, "main") and callable(mod.main):
+                      try:
+                          mod.main()
+                      except turtle.Terminator:
+                          pass
+              except turtle.Terminator:
+                  pass
+              except Exception as exc:
+                  messagebox.showerror("Launch Error", f"Could not launch '{game_name}':\n{exc}")
+              finally:
+                  try:
+                      turtle.bye()
+                  except Exception:
+                      pass
+                  root.deiconify()
+
+
+          def main():
+              try:
+                  games = get_freegames_list()
+              except Exception as exc:
+                  print(f"Error loading freegames: {exc}", file=sys.stderr)
+                  sys.exit(1)
+
+              root = tk.Tk()
+              root.title("FreeGames Launcher")
+              root.geometry("360x520")
+
+              header = ttk.Label(root, text="Select a Game", font=("TkDefaultFont", 14, "bold"))
+              header.pack(pady=(12, 6))
+
+              container = ttk.Frame(root)
+              container.pack(fill="both", expand=True, padx=12, pady=6)
+
+              canvas = tk.Canvas(container, highlightthickness=0)
+              scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+              scroll_frame = ttk.Frame(canvas)
+
+              scroll_frame.bind(
+                  "<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+              )
+              canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+              canvas.configure(yscrollcommand=scrollbar.set)
+
+              canvas.pack(side="left", fill="both", expand=True)
+              scrollbar.pack(side="right", fill="y")
+
+              for name in games:
+                  label = name.replace("_", " ").title()
+                  btn = ttk.Button(
+                      scroll_frame,
+                      text=label,
+                      command=lambda g=name: launch_game(g, root),
+                  )
+                  btn.pack(fill="x", pady=3, padx=4)
+
+              quit_btn = ttk.Button(root, text="Quit", command=root.destroy)
+              quit_btn.pack(pady=(4, 12))
+
+              root.mainloop()
+
+
+          if __name__ == "__main__":
+              main()
+          EOF
 
           # Resize and install 256x256 icon
           ICON_FILE=$(ls *.png | head -n 1)
@@ -41,14 +142,14 @@ jobs:
           "
           ln -s freegames.png AppDir/.DirIcon
 
-          # Create .desktop entry
+          # Create GUI .desktop entry (Terminal=false)
           cat << 'EOF' > AppDir/freegames.desktop
           [Desktop Entry]
           Type=Application
           Name=FreeGames Launcher
           Exec=AppRun
           Icon=freegames
-          Terminal=true
+          Terminal=false
           Categories=Game;
           EOF
 
