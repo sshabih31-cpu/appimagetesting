@@ -1,0 +1,46 @@
+name: Build CelLua AppImage
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download CelLua v2.0.2, LÖVE & appimagetool
+        run: |
+          wget -L -O CelLua.love "https://archive.org/download/cel-lua-machine-v-2.0.2/CelLua%20Machine%20v2.0.2.love"
+          wget -q https://github.com
+          wget -q https://github.com
+          chmod +x love-11.5-x86_64.AppImage appimagetool-x86_64.AppImage
+
+      - name: Extract Icon & Fuse CelLua
+        run: |
+          ./love-11.5-x86_64.AppImage --appimage-extract
+          cat squashfs-root/bin/love CelLua.love > squashfs-root/bin/CelLua
+          chmod +x squashfs-root/bin/CelLua
+          rm squashfs-root/bin/love
+
+          # Extract Puller texture from CelLua.love and scale cleanly to 256x256
+          unzip -p CelLua.love textures/puller.png > raw_icon.png
+          convert raw_icon.png -filter point -resize 256x256 squashfs-root/cellua.png
+          rm -f squashfs-root/love.svg squashfs-root/.DirIcon
+          ln -s cellua.png squashfs-root/.DirIcon
+
+          # Update desktop metadata & AppRun
+          sed -i 's/Exec=love %f/Exec=CelLua %f/g' squashfs-root/love.desktop
+          sed -i 's/Name=LÖVE/Name=CelLua Machine/g' squashfs-root/love.desktop
+          sed -i 's/Icon=love/Icon=cellua/g' squashfs-root/love.desktop
+
+          printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "${0}")")"\nexec "$HERE/bin/CelLua" "$@"\n' > squashfs-root/AppRun
+          chmod +x squashfs-root/AppRun
+
+      - name: Package AppImage
+        run: |
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run squashfs-root CelLua-v2.0.2-x86_64.AppImage
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: CelLua-v2.0.2-Linux-AppImage
+          path: CelLua-v2.0.2-x86_64.AppImage
