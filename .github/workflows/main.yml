@@ -1,4 +1,4 @@
-name: Build FreeGames AppImage
+name: Build AppImage Maker Tool
 
 on:
   workflow_dispatch:
@@ -7,123 +7,409 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo (for icon)
+      - name: Checkout repo (for optional icon)
         uses: actions/checkout@v4
 
-      - name: Download appimagetool
+      - name: Download runtimes & appimagetool
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Download appimagetool
           gh release download continuous --repo AppImage/appimagetool --pattern "*x86_64.AppImage" --output appimagetool.AppImage
           chmod +x appimagetool.AppImage
 
-      - name: Build AppDir (GUI Launcher + Python venv + freegames + Icon)
+          # Download LÖVE 11.5 AppImage for .love packaging
+          gh release download 11.5 --repo love2d/love --pattern "*x86_64.AppImage" --output love.AppImage
+          chmod +x love.AppImage
+
+          # Download latest nightly Ruffle Linux x86_64 build for .swf packaging
+          RUFFLE_TAG=$(gh release list --repo ruffle-rs/ruffle --limit 1 --json tagName --jq '.[0].tagName')
+          gh release download "$RUFFLE_TAG" --repo ruffle-rs/ruffle --pattern "*linux-x86_64.tar.gz" --output ruffle.tar.gz
+
+      - name: Assemble AppImage Maker AppDir
         run: |
           sudo apt-get update && sudo apt-get install -y python3-pil python3-venv python3-tk
-          mkdir -p AppDir/opt
+          mkdir -p AppDir/opt/runtimes/love AppDir/opt/runtimes/ruffle
 
-          # Create isolated virtual environment inside AppDir and install freegames
+          # Create bundled Python environment with Pillow inside the tool
           python3 -m venv --copies AppDir/opt/venv
           AppDir/opt/venv/bin/pip install --upgrade pip
-          AppDir/opt/venv/bin/pip install freegames
+          AppDir/opt/venv/bin/pip install pillow
 
-          # Write GUI launcher script so it works from desktop/file-manager or terminal
-          cat << 'EOF' > AppDir/opt/launcher.py
-          import importlib
-          import pkgutil
+          # Bundle appimagetool
+          cp appimagetool.AppImage AppDir/opt/runtimes/appimagetool.AppImage
+          chmod +x AppDir/opt/runtimes/appimagetool.AppImage
+
+          # Extract LÖVE runtime into AppDir so .love builds need no extra runtime download
+          ./love.AppImage --appimage-extract
+          cp -r squashfs-root/* AppDir/opt/runtimes/love/
+          rm -rf squashfs-root
+
+          # Extract Ruffle binary into AppDir so .swf builds need no extra runtime download
+          mkdir -p tmp_ruffle
+          tar -xzf ruffle.tar.gz -C tmp_ruffle
+          RUFFLE_BIN=$(find tmp_ruffle -name "ruffle" -type f | head -n 1)
+          cp "$RUFFLE_BIN" AppDir/opt/runtimes/ruffle/ruffle
+          chmod +x AppDir/opt/runtimes/ruffle/ruffle
+          rm -rf tmp_ruffle
+
+          # Write the GUI AppImage Maker application
+          cat << 'EOF' > AppDir/opt/maker.py
+          import os
+          import re
+          import shlex
+          import shutil
+          import subprocess
           import sys
+          import tempfile
+          import threading
           import tkinter as tk
-          from tkinter import messagebox, ttk
-          import turtle
+          import urllib.request
+          import zipfile
+          from tkinter import filedialog, messagebox, ttk
+          from PIL import Image, ImageDraw
 
 
-          def get_freegames_list():
-              import freegames
-
-              games = []
-              package_path = getattr(freegames, "__path__", None)
-              if package_path:
-                  for _, name, is_pkg in pkgutil.iter_modules(package_path):
-                      if not is_pkg and not name.startswith("_"):
-                          games.append(name)
-              return sorted(games)
+          SUPPORTED_EXTS = [".p8.png", ".py", ".swf", ".html", ".love", ".p8", ".zip", ".sh"]
 
 
-          def launch_game(game_name, root):
-              module_name = f"freegames.{game_name}"
-              root.withdraw()
-              try:
-                  turtle.TurtleScreen._RUNNING = True
-                  try:
-                      turtle.clearscreen()
-                  except turtle.Terminator:
-                      pass
+          def slugify_name(name):
+              cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name.strip())
+              cleaned = cleaned.strip("-")
+              return cleaned or "CustomApp"
 
-                  if module_name in sys.modules:
-                      mod = importlib.reload(sys.modules[module_name])
-                  else:
-                      mod = importlib.import_module(module_name)
 
-                  if hasattr(mod, "main") and callable(mod.main):
-                      try:
-                          mod.main()
-                      except turtle.Terminator:
-                          pass
-              except turtle.Terminator:
-                  pass
-              except Exception as exc:
-                  messagebox.showerror("Launch Error", f"Could not launch '{game_name}':\n{exc}")
-              finally:
-                  try:
-                      turtle.bye()
-                  except Exception:
-                      pass
-                  root.deiconify()
+          def detect_ext(name_or_url):
+              lower = name_or_url.split("?")[0].split("#")[0].lower()
+              for ext in SUPPORTED_EXTS:
+                  if lower.endswith(ext):
+                      return ext
+              return ""
+
+
+          def prepare_icon(icon_path, out_png):
+              if icon_path and os.path.isfile(icon_path):
+                  img = Image.open(icon_path).convert("RGBA")
+                  if img.size != (256, 256):
+                      img = img.resize((256, 256), Image.NEAREST)
+                  img.save(out_png)
+              else:
+                  img = Image.new("RGBA", (256, 256), (32, 42, 64, 255))
+                  draw = ImageDraw.Draw(img)
+                  draw.rounded_rectangle([28, 28, 228, 228], radius=32, fill=(79, 140, 255, 255))
+                  draw.polygon([(128, 66), (186, 166), (70, 166)], fill=(255, 255, 255, 255))
+                  img.save(out_png)
+
+
+          def write_desktop_and_icon(app_dir, app_name, icon_src_png):
+              shutil.copy2(icon_src_png, os.path.join(app_dir, "appicon.png"))
+              dir_icon = os.path.join(app_dir, ".DirIcon")
+              if os.path.lexists(dir_icon):
+                  os.unlink(dir_icon)
+              os.symlink("appicon.png", dir_icon)
+
+              desktop_content = (
+                  "[Desktop Entry]\n"
+                  "Type=Application\n"
+                  f"Name={app_name}\n"
+                  "Exec=AppRun\n"
+                  "Icon=appicon\n"
+                  "Categories=Game;Utility;\n"
+              )
+              with open(os.path.join(app_dir, "customapp.desktop"), "w", encoding="utf-8") as f:
+                  f.write(desktop_content)
+
+
+          def build_appimage_payload(
+              app_name,
+              ext,
+              payload_path,
+              icon_path,
+              output_appimage,
+              runtimes_dir,
+              pip_packages_str,
+              log_fn,
+          ):
+              slug = slugify_name(app_name)
+              with tempfile.TemporaryDirectory(prefix="appimg_build_") as tmp:
+                  app_dir = os.path.join(tmp, "AppDir")
+                  os.makedirs(os.path.join(app_dir, "opt"), exist_ok=True)
+                  icon_256 = os.path.join(tmp, "icon_256.png")
+                  prepare_icon(icon_path, icon_256)
+                  write_desktop_and_icon(app_dir, app_name, icon_256)
+
+                  apprun_path = os.path.join(app_dir, "AppRun")
+
+                  if ext == ".love":
+                      log_fn("Fusing LÖVE runtime with .love archive...")
+                      shutil.copytree(os.path.join(runtimes_dir, "love"), app_dir, dirs_exist_ok=True)
+                      love_bin = os.path.join(app_dir, "bin", "love")
+                      fused_bin = os.path.join(app_dir, "bin", slug)
+                      with open(fused_bin, "wb") as out_f:
+                          with open(love_bin, "rb") as b_f:
+                              shutil.copyfileobj(b_f, out_f)
+                          with open(payload_path, "rb") as p_f:
+                              shutil.copyfileobj(p_f, out_f)
+                      os.chmod(fused_bin, 0o755)
+                      if os.path.exists(love_bin):
+                          os.remove(love_bin)
+                      with open(apprun_path, "w", encoding="utf-8") as f:
+                          f.write(
+                              "#!/bin/sh\n"
+                              'HERE="$(dirname "$(readlink -f "${0}")")"\n'
+                              f'exec "$HERE/bin/{slug}" "$@"\n'
+                          )
+
+                  elif ext == ".swf":
+                      log_fn("Bundling Ruffle runtime and SWF...")
+                      ruffle_dst = os.path.join(app_dir, "opt", "ruffle")
+                      os.makedirs(ruffle_dst, exist_ok=True)
+                      shutil.copy2(os.path.join(runtimes_dir, "ruffle", "ruffle"), os.path.join(ruffle_dst, "ruffle"))
+                      os.chmod(os.path.join(ruffle_dst, "ruffle"), 0o755)
+                      shutil.copy2(payload_path, os.path.join(ruffle_dst, "game.swf"))
+                      with open(apprun_path, "w", encoding="utf-8") as f:
+                          f.write(
+                              "#!/bin/sh\n"
+                              'HERE="$(dirname "$(readlink -f "${0}")")"\n'
+                              'exec "$HERE/opt/ruffle/ruffle" "$HERE/opt/ruffle/game.swf" "$@"\n'
+                          )
+
+                  elif ext == ".py":
+                      shutil.copy2(payload_path, os.path.join(app_dir, "opt", "script.py"))
+                      pkgs = shlex.split(pip_packages_str.strip()) if pip_packages_str.strip() else []
+                      if pkgs:
+                          log_fn(f"Creating venv and installing pip packages: {', '.join(pkgs)}...")
+                          venv_dir = os.path.join(app_dir, "opt", "venv")
+                          subprocess.run([sys.executable, "-m", "venv", "--copies", venv_dir], check=True)
+                          venv_pip = os.path.join(venv_dir, "bin", "pip")
+                          subprocess.run([venv_pip, "install", *pkgs], check=True)
+                          with open(apprun_path, "w", encoding="utf-8") as f:
+                              f.write(
+                                  "#!/bin/sh\n"
+                                  'HERE="$(dirname "$(readlink -f "${0}")")"\n'
+                                  'exec "$HERE/opt/venv/bin/python" "$HERE/opt/script.py" "$@"\n'
+                              )
+                      else:
+                          log_fn("Bundling Python script into AppDir...")
+                          with open(apprun_path, "w", encoding="utf-8") as f:
+                              f.write(
+                                  "#!/bin/sh\n"
+                                  'HERE="$(dirname "$(readlink -f "${0}")")"\n'
+                                  'exec python3 "$HERE/opt/script.py" "$@"\n'
+                              )
+
+                  elif ext == ".html":
+                      log_fn("Bundling HTML app with local launcher...")
+                      web_dir = os.path.join(app_dir, "opt", "web")
+                      os.makedirs(web_dir, exist_ok=True)
+                      shutil.copy2(payload_path, os.path.join(web_dir, "index.html"))
+                      runner_py = os.path.join(app_dir, "opt", "serve_html.py")
+                      with open(runner_py, "w", encoding="utf-8") as f:
+                          f.write(
+                              "import functools, http.server, os, socketserver, webbrowser\n"
+                              "web_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web')\n"
+                              "handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=web_dir)\n"
+                              "with socketserver.TCPServer(('127.0.0.1', 0), handler) as httpd:\n"
+                              "    port = httpd.server_address[1]\n"
+                              "    webbrowser.open(f'http://127.0.0.1:{port}/index.html')\n"
+                              "    try:\n"
+                              "        httpd.serve_forever()\n"
+                              "    except KeyboardInterrupt:\n"
+                              "        pass\n"
+                          )
+                      with open(apprun_path, "w", encoding="utf-8") as f:
+                          f.write(
+                              "#!/bin/sh\n"
+                              'HERE="$(dirname "$(readlink -f "${0}")")"\n'
+                              'exec python3 "$HERE/opt/serve_html.py" "$@"\n'
+                          )
+
+                  elif ext in (".p8", ".p8.png"):
+                      log_fn("Bundling PICO-8 cartridge into AppDir...")
+                      cart_name = "cart.p8.png" if ext == ".p8.png" else "cart.p8"
+                      shutil.copy2(payload_path, os.path.join(app_dir, "opt", cart_name))
+                      with open(apprun_path, "w", encoding="utf-8") as f:
+                          f.write(
+                              "#!/bin/sh\n"
+                              'HERE="$(dirname "$(readlink -f "${0}")")"\n'
+                              'if command -v pico8 >/dev/null 2>&1; then\n'
+                              f'  exec pico8 -run "$HERE/opt/{cart_name}" "$@"\n'
+                              "else\n"
+                              '  echo "pico8 binary not found in PATH." >&2\n'
+                              "  exit 1\n"
+                              "fi\n"
+                          )
+
+                  elif ext == ".sh":
+                      log_fn("Bundling shell script into AppDir...")
+                      shutil.copy2(payload_path, os.path.join(app_dir, "opt", "run.sh"))
+                      os.chmod(os.path.join(app_dir, "opt", "run.sh"), 0o755)
+                      with open(apprun_path, "w", encoding="utf-8") as f:
+                          f.write(
+                              "#!/bin/sh\n"
+                              'HERE="$(dirname "$(readlink -f "${0}")")"\n'
+                              'exec sh "$HERE/opt/run.sh" "$@"\n'
+                          )
+
+                  elif ext == ".zip":
+                      log_fn("Extracting .zip bundle into AppDir...")
+                      extract_dir = os.path.join(app_dir, "opt", "bundle")
+                      os.makedirs(extract_dir, exist_ok=True)
+                      with zipfile.ZipFile(payload_path, "r") as zf:
+                          zf.extractall(extract_dir)
+                      with open(apprun_path, "w", encoding="utf-8") as f:
+                          f.write(
+                              "#!/bin/sh\n"
+                              'HERE="$(dirname "$(readlink -f "${0}")")"\n'
+                              'BUNDLE="$HERE/opt/bundle"\n'
+                              'if [ -f "$BUNDLE/AppRun" ]; then chmod +x "$BUNDLE/AppRun"; exec "$BUNDLE/AppRun" "$@"; fi\n'
+                              'if [ -f "$BUNDLE/index.html" ]; then exec xdg-open "$BUNDLE/index.html"; fi\n'
+                              'if [ -f "$BUNDLE/main.py" ]; then exec python3 "$BUNDLE/main.py" "$@"; fi\n'
+                              'echo "Extracted bundle to $BUNDLE" >&2\n'
+                          )
+
+                  os.chmod(apprun_path, 0o755)
+
+                  appimagetool_bin = os.path.join(runtimes_dir, "appimagetool.AppImage")
+                  log_fn("Packaging .AppImage with appimagetool...")
+                  env = os.environ.copy()
+                  env["ARCH"] = "x86_64"
+                  res = subprocess.run(
+                      [appimagetool_bin, "--appimage-extract-and-run", app_dir, output_appimage],
+                      env=env,
+                      capture_output=True,
+                      text=True,
+                  )
+                  if res.returncode != 0:
+                      raise RuntimeError(res.stderr or res.stdout or "appimagetool failed")
+                  os.chmod(output_appimage, 0o755)
+
+
+          def download_url_to_file(url, dest_path):
+              req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+              with urllib.request.urlopen(req, timeout=60) as resp, open(dest_path, "wb") as out:
+                  shutil.copyfileobj(resp, out)
 
 
           def main():
-              try:
-                  games = get_freegames_list()
-              except Exception as exc:
-                  print(f"Error loading freegames: {exc}", file=sys.stderr)
-                  sys.exit(1)
+              script_dir = os.path.dirname(os.path.abspath(__file__))
+              runtimes_dir = os.path.join(script_dir, "runtimes")
 
               root = tk.Tk()
-              root.title("FreeGames Launcher")
-              root.geometry("360x520")
+              root.title("AppImage Maker (Linux x86_64)")
+              root.geometry("470x520")
 
-              header = ttk.Label(root, text="Select a Game", font=("TkDefaultFont", 14, "bold"))
-              header.pack(pady=(12, 6))
+              pad = {"padx": 14, "pady": 5}
 
-              container = ttk.Frame(root)
-              container.pack(fill="both", expand=True, padx=12, pady=6)
+              ttk.Label(root, text="App Name:").pack(anchor="w", **pad)
+              name_var = tk.StringVar()
+              ttk.Entry(root, textvariable=name_var).pack(fill="x", padx=14)
 
-              canvas = tk.Canvas(container, highlightthickness=0)
-              scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-              scroll_frame = ttk.Frame(canvas)
+              mode_var = tk.StringVar(value="file")
+              mode_frame = ttk.Frame(root)
+              mode_frame.pack(fill="x", padx=14, pady=(10, 4))
+              ttk.Radiobutton(mode_frame, text="Local File", variable=mode_var, value="file").pack(side="left", padx=(0, 14))
+              ttk.Radiobutton(mode_frame, text="Direct Link", variable=mode_var, value="url").pack(side="left")
 
-              scroll_frame.bind(
-                  "<Configure>",
-                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
-              )
-              canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-              canvas.configure(yscrollcommand=scrollbar.set)
+              src_var = tk.StringVar()
+              src_row = ttk.Frame(root)
+              src_row.pack(fill="x", padx=14)
+              src_entry = ttk.Entry(src_row, textvariable=src_var)
+              src_entry.pack(side="left", fill="x", expand=True)
 
-              canvas.pack(side="left", fill="both", expand=True)
-              scrollbar.pack(side="right", fill="y")
-
-              for name in games:
-                  label = name.replace("_", " ").title()
-                  btn = ttk.Button(
-                      scroll_frame,
-                      text=label,
-                      command=lambda g=name: launch_game(g, root),
+              def pick_source():
+                  path = filedialog.askopenfilename(
+                      title="Select Source File",
+                      filetypes=[("Supported Files", "*.py *.swf *.html *.love *.p8 *.png *.zip *.sh"), ("All Files", "*.*")],
                   )
-                  btn.pack(fill="x", pady=3, padx=4)
+                  if path:
+                      src_var.set(path)
 
-              quit_btn = ttk.Button(root, text="Quit", command=root.destroy)
-              quit_btn.pack(pady=(4, 12))
+              ttk.Button(src_row, text="Browse", command=pick_source).pack(side="left", padx=(6, 0))
 
+              ttk.Label(root, text="Extra pip Packages (for .py files, space-separated):").pack(anchor="w", padx=14, pady=(10, 4))
+              pip_var = tk.StringVar()
+              ttk.Entry(root, textvariable=pip_var).pack(fill="x", padx=14)
+
+              icon_var = tk.StringVar()
+              ttk.Label(root, text="PNG Icon (Optional, resized 256x256 Nearest Neighbor):").pack(anchor="w", padx=14, pady=(10, 4))
+              icon_row = ttk.Frame(root)
+              icon_row.pack(fill="x", padx=14)
+              ttk.Entry(icon_row, textvariable=icon_var).pack(side="left", fill="x", expand=True)
+
+              def pick_icon():
+                  path = filedialog.askopenfilename(title="Select PNG Icon", filetypes=[("PNG Image", "*.png")])
+                  if path:
+                      icon_var.set(path)
+
+              ttk.Button(icon_row, text="Browse", command=pick_icon).pack(side="left", padx=(6, 0))
+
+              status_var = tk.StringVar(value="Ready.")
+              ttk.Label(root, textvariable=status_var, wraplength=430).pack(anchor="w", padx=14, pady=(12, 6))
+
+              build_btn = ttk.Button(root, text="Build & Save .AppImage")
+              build_btn.pack(pady=8)
+
+              def start_build():
+                  app_name = name_var.get().strip()
+                  src_val = src_var.get().strip()
+                  icon_val = icon_var.get().strip()
+                  pip_val = pip_var.get().strip()
+                  mode = mode_var.get()
+
+                  if not app_name:
+                      messagebox.showwarning("Missing Name", "Please enter an App Name.")
+                      return
+                  if not src_val:
+                      messagebox.showwarning("Missing Source", "Please choose a file or enter a URL.")
+                      return
+
+                  ext = detect_ext(src_val)
+                  if not ext:
+                      messagebox.showerror("Unsupported Type", f"Unsupported format. Allowed: {', '.join(SUPPORTED_EXTS)}")
+                      return
+
+                  default_out = f"{slugify_name(app_name)}-x86_64.AppImage"
+                  out_path = filedialog.asksaveasfilename(
+                      title="Save Generated AppImage",
+                      initialfile=default_out,
+                      defaultextension=".AppImage",
+                      filetypes=[("AppImage", "*.AppImage")],
+                  )
+                  if not out_path:
+                      return
+
+                  build_btn.state(["disabled"])
+
+                  def worker():
+                      try:
+                          if mode == "file":
+                              if not os.path.isfile(src_val):
+                                  raise FileNotFoundError(f"File not found: {src_val}")
+                              build_appimage_payload(
+                                  app_name, ext, src_val, icon_val or None, out_path, runtimes_dir, pip_val,
+                                  lambda msg: root.after(0, status_var.set, msg),
+                              )
+                          else:
+                              with tempfile.TemporaryDirectory(prefix="dl_") as dl_tmp:
+                                  dl_file = os.path.join(dl_tmp, "input" + ext)
+                                  root.after(0, status_var.set, "Downloading source URL...")
+                                  download_url_to_file(src_val, dl_file)
+                                  build_appimage_payload(
+                                      app_name, ext, dl_file, icon_val or None, out_path, runtimes_dir, pip_val,
+                                      lambda msg: root.after(0, status_var.set, msg),
+                                  )
+                          root.after(0, status_var.set, f"Done! Saved: {out_path}")
+                          root.after(0, messagebox.showinfo, "Success", f"Created:\n{out_path}")
+                      except Exception as exc:
+                          root.after(0, status_var.set, f"Error: {exc}")
+                          root.after(0, messagebox.showerror, "Build Failed", str(exc))
+                      finally:
+                          root.after(0, lambda: build_btn.state(["!disabled"]))
+
+                  threading.Thread(target=worker, daemon=True).start()
+
+              build_btn.configure(command=start_build)
               root.mainloop()
 
 
@@ -131,42 +417,48 @@ jobs:
               main()
           EOF
 
-          # Resize and install 256x256 icon
-          ICON_FILE=$(ls *.png | head -n 1)
+          # Optional repo icon for the maker tool itself (falls back to generated icon if none in repo)
+          ICON_FILE=$(ls *.png 2>/dev/null | head -n 1 || true)
           python3 -c "
-          from PIL import Image
-          img = Image.open('$ICON_FILE').convert('RGBA')
-          if img.size != (256, 256):
-              img = img.resize((256, 256), Image.NEAREST)
-          img.save('AppDir/freegames.png')
+          from PIL import Image, ImageDraw
+          icon_path = '$ICON_FILE'
+          if icon_path:
+              img = Image.open(icon_path).convert('RGBA')
+              if img.size != (256, 256):
+                  img = img.resize((256, 256), Image.NEAREST)
+          else:
+              img = Image.new('RGBA', (256, 256), (32, 42, 64, 255))
+              d = ImageDraw.Draw(img)
+              d.rounded_rectangle([24, 24, 232, 232], radius=36, fill=(79, 140, 255, 255))
+              d.text((64, 108), 'APPIMG', fill=(255, 255, 255, 255))
+          img.save('AppDir/maker.png')
           "
-          ln -s freegames.png AppDir/.DirIcon
+          ln -s maker.png AppDir/.DirIcon
 
-          # Create GUI .desktop entry (Terminal=false)
-          cat << 'EOF' > AppDir/freegames.desktop
+          cat << 'EOF' > AppDir/maker.desktop
           [Desktop Entry]
           Type=Application
-          Name=FreeGames Launcher
+          Name=AppImage Maker
           Exec=AppRun
-          Icon=freegames
+          Icon=maker
           Terminal=false
-          Categories=Game;
+          Categories=Utility;Development;
           EOF
 
-          # Create AppRun using bundled venv Python
           cat << 'EOF' > AppDir/AppRun
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "${0}")")"
-          exec "$HERE/opt/venv/bin/python" "$HERE/opt/launcher.py" "$@"
+          export PATH="$HERE/opt/venv/bin:$PATH"
+          exec python3 "$HERE/opt/maker.py" "$@"
           EOF
           chmod +x AppDir/AppRun
 
-      - name: Package AppImage
+      - name: Package AppImage Maker
         run: |
-          ARCH=x86_64 ./appimagetool.AppImage --appimage-extract-and-run AppDir FreeGames-Launcher-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool.AppImage --appimage-extract-and-run AppDir AppImage-Maker-x86_64.AppImage
 
-      - name: Upload AppImage
+      - name: Upload AppImage Maker Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FreeGames-Launcher-Linux-AppImage
-          path: FreeGames-Launcher-x86_64.AppImage
+          name: AppImage-Maker-Linux-AppImage
+          path: AppImage-Maker-x86_64.AppImage
